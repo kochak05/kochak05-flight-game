@@ -1,133 +1,241 @@
-// render.js — everything the eye sees: sea, islands, runway, rings, clouds, aircraft.
-// One job: draw the world and the plane from the camera's point of view.
+// render.js — everything the eye sees, in a pseudo-3D chase view.
+// One job: draw the world and the plane from a camera behind the aircraft.
+// The camera sits behind the plane and looks forward along its heading, so
+// the horizon, the sky, the runway and the rings are all ahead of the pilot.
 
 import { RUNWAY } from './world.js';
 import { drawHud } from './hud.js';
 
 const W = 1280;
 const H = 800;
+const FOCAL = 720; // pixels per metre at 1 m ahead of the camera
+const CAM = 140; // camera sits this far (m) behind the plane
+const PLANE_X = W / 2;
+const PLANE_Y = H * 0.64; // the big aircraft, low centre of the frame
 
-// Zoom in pixels per metre: high altitude sees more of the strait.
-function zoomFor(altitude) {
-  return Math.max(0.14, 0.62 - altitude * 0.0009);
+// Horizon height: pitch moves it — climb and the horizon drops away.
+function horizonY(plane) {
+  return H * 0.36 + plane.pitch * 520;
 }
 
-function worldToScreen(plane, zoom, wx, wy) {
+// Project a world point (wx, wy, altitude in metres) onto the screen.
+// d is the distance ahead of the plane, lateral is the sideways offset.
+function project(plane, horizon, wx, wy, alt) {
   const dx = wx - plane.x;
   const dy = wy - plane.y;
-  const cos = Math.cos(plane.heading);
   const sin = Math.sin(plane.heading);
-  // Rotate so the heading points up the screen.
-  const rx = dx * cos - dy * sin;
-  const ry = dx * sin + dy * cos;
-  return { x: W / 2 + rx * zoom, y: H * 0.58 - ry * zoom };
+  const cos = Math.cos(plane.heading);
+  const d = dx * sin + dy * cos; // forward
+  const lateral = dx * cos - dy * sin; // right
+  const depth = d + CAM;
+  if (depth < 20) return null;
+  const scale = FOCAL / depth;
+  return {
+    x: W / 2 + lateral * scale,
+    y: horizon + (plane.altitude - alt) * scale,
+    scale,
+    d,
+    lateral,
+  };
 }
 
-function islandPath(ctx, island, scale) {
+function fadeWithDistance(d, near, far) {
+  if (d <= near) return 1;
+  if (d >= far) return 0;
+  return 1 - (d - near) / (far - near);
+}
+
+// ---- sky -----------------------------------------------------------------
+
+function drawSky(ctx, horizon, plane, time) {
+  const sky = ctx.createLinearGradient(0, 0, 0, Math.max(horizon, 1));
+  sky.addColorStop(0, '#2f7fd0');
+  sky.addColorStop(0.55, '#7db8e8');
+  sky.addColorStop(1, '#cfe8f7');
+  ctx.fillStyle = sky;
+  ctx.fillRect(0, 0, W, Math.max(horizon, 1));
+
+  // Sun, high on the right, with a warm glow.
+  const sunX = W * 0.76;
+  const sunY = Math.max(50, horizon - 150);
+  const glow = ctx.createRadialGradient(sunX, sunY, 8, sunX, sunY, 180);
+  glow.addColorStop(0, 'rgba(255, 244, 200, 0.95)');
+  glow.addColorStop(0.25, 'rgba(255, 226, 140, 0.45)');
+  glow.addColorStop(1, 'rgba(255, 226, 140, 0)');
+  ctx.fillStyle = glow;
+  ctx.fillRect(sunX - 190, sunY - 190, 380, 380);
+  ctx.fillStyle = '#fff6cf';
   ctx.beginPath();
-  for (let i = 0; i <= island.points; i++) {
-    const idx = i % island.points;
-    const angle = (idx / island.points) * Math.PI * 2;
-    const r = island.radii[idx] * scale;
-    const x = island.cx + Math.cos(angle) * r;
-    const y = island.cy + Math.sin(angle) * r;
-    if (i === 0) ctx.moveTo(x, y);
-    else ctx.lineTo(x, y);
-  }
-  ctx.closePath();
+  ctx.arc(sunX, sunY, 26, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.fillStyle = '#ffffff';
+  ctx.beginPath();
+  ctx.arc(sunX, sunY, 18, 0, Math.PI * 2);
+  ctx.fill();
 }
 
-function drawSea(ctx, plane, zoom, world, time) {
-  const grad = ctx.createLinearGradient(0, 0, 0, H);
-  grad.addColorStop(0, '#0e4a75');
-  grad.addColorStop(0.55, '#0d5a8a');
-  grad.addColorStop(1, '#0a3f63');
-  ctx.fillStyle = grad;
-  ctx.fillRect(0, 0, W, H);
-
-  // Wave strokes, only those near the view.
-  const viewR = Math.hypot(W, H) / zoom + 200;
-  ctx.lineWidth = 1.5;
-  for (const wv of world.waves) {
-    const dx = wv.x - plane.x;
-    const dy = wv.y - plane.y;
-    if (Math.abs(dx) > viewR || Math.abs(dy) > viewR) continue;
-    const p = worldToScreen(plane, zoom, wv.x, wv.y);
-    ctx.strokeStyle = `rgba(180, 225, 255, ${wv.alpha})`;
-    ctx.beginPath();
-    const len = wv.len * zoom;
-    ctx.moveTo(p.x - Math.cos(wv.angle) * len * 0.5, p.y - Math.sin(wv.angle) * len * 0.5);
-    ctx.lineTo(p.x + Math.cos(wv.angle) * len * 0.5, p.y + Math.sin(wv.angle) * len * 0.5);
-    ctx.stroke();
+// A hazy ridge of far land along the horizon, so the strait reads as a
+// place even when no island is near. Deterministic, from the heading.
+function drawDistantRidge(ctx, horizon, plane) {
+  ctx.fillStyle = 'rgba(74, 110, 138, 0.55)';
+  ctx.beginPath();
+  ctx.moveTo(0, horizon + 2);
+  const base = Math.sin(plane.heading * 2.3) * 18;
+  for (let x = 0; x <= W; x += 80) {
+    const peak = 14 + 22 * Math.abs(Math.sin(x * 0.011 + plane.heading * 3.1 + base));
+    ctx.lineTo(x, horizon - peak);
   }
+  ctx.lineTo(W, horizon + 2);
+  ctx.closePath();
+  ctx.fill();
+  // A second, nearer ridge, greener.
+  ctx.fillStyle = 'rgba(58, 102, 84, 0.45)';
+  ctx.beginPath();
+  ctx.moveTo(0, horizon + 2);
+  for (let x = 0; x <= W; x += 110) {
+    const peak = 6 + 14 * Math.abs(Math.sin(x * 0.017 + plane.heading * 5.7 + 2));
+    ctx.lineTo(x, horizon - peak);
+  }
+  ctx.lineTo(W, horizon + 2);
+  ctx.closePath();
+  ctx.fill();
+}
 
-  // Sun glitter: a bright band that follows the view.
-  const glitter = ctx.createRadialGradient(W * 0.72, H * 0.2, 10, W * 0.72, H * 0.2, 320);
-  glitter.addColorStop(0, 'rgba(255, 240, 190, 0.14)');
+// ---- sea -----------------------------------------------------------------
+
+function drawSea(ctx, horizon, plane, world, time) {
+  const sea = ctx.createLinearGradient(0, horizon, 0, H);
+  sea.addColorStop(0, '#2f7fa8');
+  sea.addColorStop(0.35, '#14608c');
+  sea.addColorStop(1, '#083a5e');
+  ctx.fillStyle = sea;
+  ctx.fillRect(0, Math.max(horizon, 0), W, H - Math.max(horizon, 0));
+
+  // Sun glitter on the water, a bright path under the sun.
+  const glitter = ctx.createLinearGradient(0, horizon, 0, H);
+  glitter.addColorStop(0, 'rgba(255, 240, 190, 0.20)');
   glitter.addColorStop(1, 'rgba(255, 240, 190, 0)');
   ctx.fillStyle = glitter;
-  ctx.fillRect(0, 0, W, H);
+  ctx.beginPath();
+  ctx.moveTo(W * 0.68, horizon);
+  ctx.lineTo(W * 0.84, horizon);
+  ctx.lineTo(W * 0.95, H);
+  ctx.lineTo(W * 0.57, H);
+  ctx.closePath();
+  ctx.fill();
+
+  // Wave streaks, projected onto the sea surface, fading with distance.
+  ctx.lineWidth = 1.5;
+  for (const wv of world.waves) {
+    const p = project(plane, horizon, wv.x, wv.y, 0);
+    if (!p || p.d < 0 || p.d > 2600) continue;
+    if (p.x < -80 || p.x > W + 80 || p.y < horizon - 4 || p.y > H + 20) continue;
+    const len = wv.len * p.scale;
+    if (len < 2) continue;
+    ctx.strokeStyle = `rgba(190, 230, 255, ${wv.alpha * fadeWithDistance(p.d, 300, 2400)})`;
+    ctx.beginPath();
+    ctx.moveTo(p.x - len * 0.5, p.y);
+    ctx.lineTo(p.x + len * 0.5, p.y);
+    ctx.stroke();
+  }
 }
 
-function drawIslands(ctx, plane, zoom, world) {
-  const viewR = Math.hypot(W, H) / zoom + 800;
-  for (const island of world.islands) {
-    const dx = island.cx - plane.x;
-    const dy = island.cy - plane.y;
-    if (Math.abs(dx) > viewR || Math.abs(dy) > viewR) continue;
+// ---- islands ---------------------------------------------------------------
 
-    // Transform each outline point into screen space.
-    const outline = (scale) => {
+function islandOutlinePoints(island, shrink) {
+  const pts = [];
+  for (let i = 0; i < island.points; i++) {
+    const angle = (i / island.points) * Math.PI * 2;
+    const r = island.radii[i] * shrink;
+    pts.push({ x: island.cx + Math.cos(angle) * r, y: island.cy + Math.sin(angle) * r });
+  }
+  return pts;
+}
+
+function drawIsland(ctx, plane, horizon, island) {
+  const centre = project(plane, horizon, island.cx, island.cy, 0);
+  if (!centre || centre.d < -250 || centre.d > 4600) return;
+  if (centre.x < -700 || centre.x > W + 700) return;
+  const haze = fadeWithDistance(centre.d, 800, 4200);
+
+  // Beach, then grass: the outline projected onto the sea, in perspective.
+  const beach = islandOutlinePoints(island, 1.06).map((p) => project(plane, horizon, p.x, p.y, 0)).filter(Boolean);
+  const grass = islandOutlinePoints(island, 1.0).map((p) => project(plane, horizon, p.x, p.y, 0)).filter(Boolean);
+  if (beach.length < 3 || grass.length < 3) return;
+  const poly = (pts, fill) => {
+    ctx.beginPath();
+    ctx.moveTo(pts[0].x, pts[0].y);
+    for (const p of pts.slice(1)) ctx.lineTo(p.x, p.y);
+    ctx.closePath();
+    ctx.fillStyle = fill;
+    ctx.fill();
+  };
+  poly(beach, `rgba(232, 217, 160, ${0.35 + 0.65 * haze})`);
+  poly(grass, haze > 0.5 ? '#5d8f57' : '#6f9a6a');
+
+  // The mountain: a shaded peak rising from the island's projected base.
+  if (island.peak > 60) {
+    const peak = project(plane, horizon, island.cx, island.cy, island.peak);
+    if (peak) {
+      const xs = grass.map((p) => p.x);
+      const baseY = Math.max(...grass.map((p) => p.y));
+      const left = peak.x - (Math.max(...xs) - Math.min(...xs)) * 0.35;
+      const right = peak.x + (Math.max(...xs) - Math.min(...xs)) * 0.35;
       ctx.beginPath();
-      for (let i = 0; i <= island.points; i++) {
-        const idx = i % island.points;
-        const angle = (idx / island.points) * Math.PI * 2;
-        const r = island.radii[idx] * scale;
-        const p = worldToScreen(plane, zoom, island.cx + Math.cos(angle) * r, island.cy + Math.sin(angle) * r);
-        if (i === 0) ctx.moveTo(p.x, p.y);
-        else ctx.lineTo(p.x, p.y);
-      }
+      ctx.moveTo(left, baseY);
+      ctx.lineTo(peak.x, peak.y);
+      ctx.lineTo(right, baseY);
       ctx.closePath();
-    };
-
-    // Beach, then grass, then the mountain crown.
-    outline(1.06);
-    ctx.fillStyle = '#e8d9a0';
-    ctx.fill();
-    outline(1.0);
-    const grass = ctx.createRadialGradient(
-      worldToScreen(plane, zoom, island.cx, island.cy).x,
-      worldToScreen(plane, zoom, island.cx, island.cy).y,
-      4,
-      worldToScreen(plane, zoom, island.cx, island.cy).x,
-      worldToScreen(plane, zoom, island.cx, island.cy).y,
-      island.radius * zoom,
-    );
-    grass.addColorStop(0, '#7fb069');
-    grass.addColorStop(1, '#4d7c4a');
-    ctx.fillStyle = grass;
-    ctx.fill();
-    if (island.peak > 60) {
-      outline(0.45);
-      ctx.fillStyle = '#8a7a68';
+      ctx.fillStyle = haze > 0.5 ? '#7d6f5e' : '#8a7d6d';
       ctx.fill();
-      outline(0.22);
-      ctx.fillStyle = '#e8e4da';
+      // Sunlit slope on the right, shadow on the left.
+      ctx.beginPath();
+      ctx.moveTo(peak.x, peak.y);
+      ctx.lineTo(right, baseY);
+      ctx.lineTo((peak.x + right) / 2, baseY);
+      ctx.closePath();
+      ctx.fillStyle = 'rgba(255, 235, 200, 0.22)';
       ctx.fill();
+      if (island.peak > 150) {
+        const snowY = peak.y + (baseY - peak.y) * 0.22;
+        ctx.beginPath();
+        ctx.moveTo(peak.x, peak.y);
+        ctx.lineTo(peak.x - (right - left) * 0.09, snowY);
+        ctx.lineTo(peak.x + (right - left) * 0.09, snowY);
+        ctx.closePath();
+        ctx.fillStyle = '#eef2f4';
+        ctx.fill();
+      }
     }
   }
 }
 
-function drawRunway(ctx, plane, zoom) {
+function drawIslands(ctx, plane, horizon, world) {
+  // Far islands first, so near ones overlap them.
+  const sorted = [...world.islands].sort((a, b) => {
+    const da = (a.cx - plane.x) * Math.sin(plane.heading) + (a.cy - plane.y) * Math.cos(plane.heading);
+    const db = (b.cx - plane.x) * Math.sin(plane.heading) + (b.cy - plane.y) * Math.cos(plane.heading);
+    return db - da;
+  });
+  for (const island of sorted) drawIsland(ctx, plane, horizon, island);
+}
+
+// ---- runway ----------------------------------------------------------------
+
+function drawRunway(ctx, plane, horizon) {
   const rw = RUNWAY;
   const hw = rw.width / 2;
   const hl = rw.length / 2;
   const corners = [
-    worldToScreen(plane, zoom, rw.x - hw, rw.y - hl),
-    worldToScreen(plane, zoom, rw.x + hw, rw.y - hl),
-    worldToScreen(plane, zoom, rw.x + hw, rw.y + hl),
-    worldToScreen(plane, zoom, rw.x - hw, rw.y + hl),
+    project(plane, horizon, rw.x - hw, rw.y - hl, 2),
+    project(plane, horizon, rw.x + hw, rw.y - hl, 2),
+    project(plane, horizon, rw.x + hw, rw.y + hl, 2),
+    project(plane, horizon, rw.x - hw, rw.y + hl, 2),
   ];
+  if (corners.some((c) => !c)) return;
+  const centre = project(plane, horizon, rw.x, rw.y, 2);
+  if (!centre || centre.d < -200 || centre.d > 5000) return;
+
   ctx.beginPath();
   ctx.moveTo(corners[0].x, corners[0].y);
   for (const c of corners.slice(1)) ctx.lineTo(c.x, c.y);
@@ -135,84 +243,143 @@ function drawRunway(ctx, plane, zoom) {
   ctx.fillStyle = '#2b2f36';
   ctx.fill();
   ctx.strokeStyle = '#f5f5f5';
-  ctx.lineWidth = 2;
+  ctx.lineWidth = Math.max(1, 2 * centre.scale);
   ctx.stroke();
 
-  // Centreline dashes and threshold bars.
+  // Centreline, sampled along the strip so it follows the perspective.
   ctx.strokeStyle = '#ffffff';
-  ctx.lineWidth = Math.max(1, 3 * zoom * 4);
-  ctx.setLineDash([26 * zoom, 22 * zoom]);
-  const a = worldToScreen(plane, zoom, rw.x, rw.y - hl + 30);
-  const b = worldToScreen(plane, zoom, rw.x, rw.y + hl - 30);
+  ctx.lineWidth = Math.max(1.5, 3.5 * centre.scale);
+  ctx.setLineDash([Math.max(6, 26 * centre.scale), Math.max(5, 22 * centre.scale)]);
   ctx.beginPath();
-  ctx.moveTo(a.x, a.y);
-  ctx.lineTo(b.x, b.y);
+  for (let i = 0; i <= 12; i++) {
+    const t = -hl + (i / 12) * rw.length;
+    const p = project(plane, horizon, rw.x, rw.y + t, 2);
+    if (!p) continue;
+    if (i === 0) ctx.moveTo(p.x, p.y);
+    else ctx.lineTo(p.x, p.y);
+  }
   ctx.stroke();
   ctx.setLineDash([]);
 
-  // Touchdown zone: two white bars near the southern threshold.
-  const tz1 = worldToScreen(plane, zoom, rw.x - hw * 0.6, rw.y - hl + 120);
-  const tz2 = worldToScreen(plane, zoom, rw.x + hw * 0.6, rw.y - hl + 120);
-  ctx.strokeStyle = '#ffffff';
-  ctx.lineWidth = Math.max(2, 5 * zoom * 4);
-  ctx.beginPath();
-  ctx.moveTo(tz1.x - 14 * zoom, tz1.y);
-  ctx.lineTo(tz1.x + 14 * zoom, tz1.y);
-  ctx.moveTo(tz2.x - 14 * zoom, tz2.y);
-  ctx.lineTo(tz2.x + 14 * zoom, tz2.y);
-  ctx.stroke();
-
-  // Runway label, readable when close.
-  if (zoom > 0.25) {
-    const label = worldToScreen(plane, zoom, rw.x, rw.y + hl + 90);
-    ctx.fillStyle = '#ffffff';
-    ctx.font = 'bold 15px Arial, sans-serif';
-    ctx.textAlign = 'center';
-    ctx.fillText(rw.name, label.x, label.y);
+  // Touchdown zone bars near the near threshold.
+  for (const side of [-0.6, 0.6]) {
+    const a = project(plane, horizon, rw.x + side * hw - 7, rw.y - hl + 120, 2);
+    const b = project(plane, horizon, rw.x + side * hw + 7, rw.y - hl + 120, 2);
+    if (!a || !b) continue;
+    ctx.strokeStyle = '#ffffff';
+    ctx.lineWidth = Math.max(2, 5 * centre.scale);
+    ctx.beginPath();
+    ctx.moveTo(a.x, a.y);
+    ctx.lineTo(b.x, b.y);
+    ctx.stroke();
   }
-}
 
-function drawRings(ctx, plane, zoom, rings) {
-  for (const ring of rings) {
-    const p = worldToScreen(plane, zoom, ring.x, ring.y);
-    const r = 30 * zoom;
-    if (p.x < -120 || p.x > W + 120 || p.y < -120 || p.y > H + 120) continue;
-    // Shadow on the ground below the ring, offset by its altitude.
-    const shadow = worldToScreen(plane, zoom, ring.x + ring.alt * 0.12, ring.y - ring.alt * 0.12);
-    ctx.beginPath();
-    ctx.ellipse(shadow.x, shadow.y, r * 0.9, r * 0.35, 0, 0, Math.PI * 2);
-    ctx.fillStyle = 'rgba(0, 0, 0, 0.22)';
-    ctx.fill();
-    // The gold ring itself, slightly squashed for a floating look.
-    ctx.beginPath();
-    ctx.ellipse(p.x, p.y, r, r * 0.62, 0, 0, Math.PI * 2);
-    ctx.strokeStyle = ring.collected ? 'rgba(125, 255, 158, 0.9)' : '#ffd34d';
-    ctx.lineWidth = Math.max(3, 7 * zoom);
-    ctx.stroke();
-    ctx.beginPath();
-    ctx.ellipse(p.x, p.y, r, r * 0.62, 0, 0, Math.PI * 2);
-    ctx.strokeStyle = 'rgba(255, 242, 176, 0.85)';
-    ctx.lineWidth = Math.max(1, 2.5 * zoom);
-    ctx.stroke();
-    if (!ring.collected) {
-      ctx.fillStyle = '#fff2b0';
-      ctx.font = `bold ${Math.max(11, 13 * zoom * 2)}px Arial, sans-serif`;
+  // Runway number and name, sized by distance.
+  if (centre.d < 2600) {
+    const near = project(plane, horizon, rw.x, rw.y - hl + 60, 2);
+    if (near) {
+      ctx.fillStyle = '#ffffff';
+      ctx.font = `bold ${Math.max(12, Math.round(34 * centre.scale))}px Arial, sans-serif`;
       ctx.textAlign = 'center';
-      ctx.fillText(`${ring.alt}m`, p.x, p.y - r * 0.62 - 8);
+      ctx.fillText('36', near.x, near.y - 6);
+      ctx.font = `bold ${Math.max(11, Math.round(15 * centre.scale))}px Arial, sans-serif`;
+      ctx.fillText(rw.name, centre.x, centre.y - Math.max(14, 30 * centre.scale));
     }
   }
 }
 
-function drawClouds(ctx, plane, zoom, world, time) {
-  for (const cloud of world.clouds) {
+// ---- rings -----------------------------------------------------------------
+
+function drawRings(ctx, plane, horizon, rings) {
+  const sorted = [...rings].sort((a, b) => {
+    const da = (a.x - plane.x) * Math.sin(plane.heading) + (a.y - plane.y) * Math.cos(plane.heading);
+    const db = (b.x - plane.x) * Math.sin(plane.heading) + (b.y - plane.y) * Math.cos(plane.heading);
+    return db - da;
+  });
+  for (const ring of sorted) {
+    const p = project(plane, horizon, ring.x, ring.y, ring.alt);
+    if (!p || p.d < -40 || p.d > 5200) continue;
+    const r = 30 * p.scale; // the ring is 30 m across in the world
+    if (r < 5) {
+      // Too far for a circle: a bright gold diamond marks it instead.
+      ctx.fillStyle = ring.collected ? '#7dff9e' : '#ffd34d';
+      ctx.beginPath();
+      ctx.moveTo(p.x, p.y - 7);
+      ctx.lineTo(p.x + 7, p.y);
+      ctx.lineTo(p.x, p.y + 7);
+      ctx.lineTo(p.x - 7, p.y);
+      ctx.closePath();
+      ctx.fill();
+      continue;
+    }
+    if (p.x < -r - 40 || p.x > W + r + 40 || p.y < -r - 40 || p.y > H + r + 40) continue;
+    const gold = ring.collected ? '#7dff9e' : '#ffd34d';
+    // Glow, then the gold ring, then a bright inner rim.
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, r, 0, Math.PI * 2);
+    ctx.strokeStyle = ring.collected ? 'rgba(125, 255, 158, 0.25)' : 'rgba(255, 211, 77, 0.30)';
+    ctx.lineWidth = Math.max(6, r * 0.35);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, r, 0, Math.PI * 2);
+    ctx.strokeStyle = gold;
+    ctx.lineWidth = Math.max(3, r * 0.16);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, r, 0, Math.PI * 2);
+    ctx.strokeStyle = 'rgba(255, 242, 176, 0.9)';
+    ctx.lineWidth = Math.max(1, r * 0.05);
+    ctx.stroke();
+    if (!ring.collected && p.d < 1500) {
+      ctx.fillStyle = '#fff2b0';
+      ctx.font = `bold ${Math.max(12, Math.round(r * 0.22))}px Arial, sans-serif`;
+      ctx.textAlign = 'center';
+      // The label sits above the ring, unless that would run under the
+      // top HUD panel — then it goes below the ring instead.
+      const labelY = p.y - r - 10 < 92 ? p.y + r + 20 : p.y - r - 10;
+      ctx.fillText(`${ring.alt}m  ·  ${Math.round(p.d)}m`, p.x, labelY);
+    }
+  }
+}
+
+// A chevron at the screen edge pointing at the next ring when it is off-frame.
+function drawNextRingGuide(ctx, plane, horizon, rings) {
+  const next = rings.find((r) => !r.collected);
+  if (!next) return;
+  const p = project(plane, horizon, next.x, next.y, next.alt);
+  if (!p) return;
+  if (p.x >= 60 && p.x <= W - 60 && p.y >= 90 && p.y <= H - 90) return;
+  const cx = Math.max(60, Math.min(W - 60, p.x));
+  const cy = Math.max(110, Math.min(H - 110, p.y));
+  const dir = p.x < 60 ? -1 : p.x > W - 60 ? 1 : 0;
+  ctx.fillStyle = '#ffd34d';
+  ctx.font = 'bold 14px Arial, sans-serif';
+  ctx.textAlign = 'center';
+  ctx.fillText(`RING ${Math.round(p.d)}m ${dir < 0 ? '◀' : dir > 0 ? '▶' : '▲'}`, cx, cy - 14);
+  ctx.beginPath();
+  ctx.moveTo(cx + dir * 14, cy);
+  ctx.lineTo(cx - dir * 10, cy - 9);
+  ctx.lineTo(cx - dir * 10, cy + 9);
+  ctx.closePath();
+  ctx.fill();
+}
+
+// ---- clouds ----------------------------------------------------------------
+
+function drawClouds(ctx, plane, horizon, world, time) {
+  for (let i = 0; i < world.clouds.length; i++) {
+    const cloud = world.clouds[i];
     const cx = cloud.x + time * cloud.speed;
-    const p = worldToScreen(plane, zoom, cx, cloud.y);
-    const s = cloud.size * zoom;
-    if (p.x < -s || p.x > W + s || p.y < -s || p.y > H + s) continue;
-    ctx.fillStyle = 'rgba(255, 255, 255, 0.28)';
-    for (let i = 0; i < cloud.puffs; i++) {
-      const px = p.x + (i - cloud.puffs / 2) * s * 0.42;
-      const py = p.y + Math.sin(i * 2.1) * s * 0.1;
+    const alt = 480 + (i % 3) * 90;
+    const p = project(plane, horizon, cx, cloud.y, alt);
+    if (!p || p.d < -100 || p.d > 5200) continue;
+    if (p.y > horizon + 10) continue; // clouds live in the sky
+    const s = cloud.size * p.scale;
+    if (s < 6 || p.x < -s || p.x > W + s || p.y < -s) continue;
+    ctx.fillStyle = `rgba(255, 255, 255, ${0.55 * fadeWithDistance(p.d, 500, 4200) + 0.15})`;
+    for (let j = 0; j < cloud.puffs; j++) {
+      const px = p.x + (j - cloud.puffs / 2) * s * 0.42;
+      const py = p.y + Math.sin(j * 2.1 + i) * s * 0.1;
       ctx.beginPath();
       ctx.ellipse(px, py, s * 0.42, s * 0.2, 0, 0, Math.PI * 2);
       ctx.fill();
@@ -220,23 +387,19 @@ function drawClouds(ctx, plane, zoom, world, time) {
   }
 }
 
-// The aircraft, drawn in detail: fuselage, swept wings, tail, canopy, engines.
-function drawPlane(ctx, plane, time) {
-  const cx = W / 2;
-  const cy = H * 0.58;
-  // Ground shadow: offset and fade grow with altitude.
-  const shadowOff = Math.min(46, plane.altitude * 0.12);
-  const shadowAlpha = Math.max(0.08, 0.3 - plane.altitude * 0.0004);
-  ctx.fillStyle = `rgba(0, 0, 0, ${shadowAlpha})`;
-  ctx.beginPath();
-  ctx.ellipse(cx + shadowOff, cy + shadowOff * 0.7, 52, 16, 0, 0, Math.PI * 2);
-  ctx.fill();
+// ---- the aircraft ----------------------------------------------------------
+// Drawn big, low centre, in detail: fuselage, swept wings, canopy, tail,
+// engines, nav lights. Bank rolls it; pitch squashes it slightly.
 
+function drawPlane(ctx, plane, time) {
+  const cx = PLANE_X;
+  const cy = PLANE_Y;
   ctx.save();
   ctx.translate(cx, cy);
   ctx.rotate(plane.bank * 0.45);
   const pitchSquash = 1 - Math.abs(plane.pitch) * 0.35;
-  ctx.scale(1, pitchSquash);
+  const S = 1.55; // ~180 px long, ~220 px across the wings
+  ctx.scale(S, S * pitchSquash);
 
   // Wings: swept, with tip lights.
   ctx.fillStyle = '#dfe6ee';
@@ -353,6 +516,18 @@ function drawPlane(ctx, plane, time) {
     ctx.stroke();
   }
   ctx.restore();
+
+  // Speed streaks past the wings when fast.
+  if (plane.speed > 85) {
+    ctx.strokeStyle = 'rgba(255,255,255,0.25)';
+    ctx.lineWidth = 2;
+    for (const sx of [-150, 150]) {
+      ctx.beginPath();
+      ctx.moveTo(cx + sx, cy - 40);
+      ctx.lineTo(cx + sx, cy + 30);
+      ctx.stroke();
+    }
+  }
 }
 
 function drawOverlay(ctx, title, lines, hint) {
@@ -377,12 +552,23 @@ function drawOverlay(ctx, title, lines, hint) {
 
 export function render(ctx, game, time) {
   const plane = game.plane;
-  const zoom = zoomFor(plane.altitude);
-  drawSea(ctx, plane, zoom, game.world, time);
-  drawIslands(ctx, plane, zoom, game.world);
-  drawRunway(ctx, plane, zoom);
-  drawRings(ctx, plane, zoom, game.rings);
-  drawClouds(ctx, plane, zoom, game.world, time);
+  const horizon = horizonY(plane);
+
+  // The world rolls with the bank; the HUD never does.
+  ctx.save();
+  ctx.translate(W / 2, horizon);
+  ctx.rotate(-plane.bank * 0.55);
+  ctx.translate(-W / 2, -horizon);
+  drawSky(ctx, horizon, plane, time);
+  drawDistantRidge(ctx, horizon, plane);
+  drawSea(ctx, horizon, plane, game.world, time);
+  drawIslands(ctx, plane, horizon, game.world);
+  drawRunway(ctx, plane, horizon);
+  drawRings(ctx, plane, horizon, game.rings);
+  drawClouds(ctx, plane, horizon, game.world, time);
+  ctx.restore();
+
+  drawNextRingGuide(ctx, plane, horizon, game.rings);
   drawPlane(ctx, plane, time);
   drawHud(ctx, W, H, game);
 

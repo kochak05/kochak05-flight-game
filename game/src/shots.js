@@ -26,11 +26,11 @@ export function setupShot(game, name) {
     // runway both ahead, full HUD lit. High enough to see the runway.
     game.start();
     game.plane = newPlane({
-      x: 100,
-      y: 9300,
+      x: 60,
+      y: 9280,
       heading: 0,
-      altitude: 380,
-      speed: 105,
+      altitude: 180,
+      speed: 100,
       fuel: 62,
     });
     game.plane.throttle = 0.7;
@@ -50,8 +50,8 @@ export function setupShot(game, name) {
     // leg 1's third ring at (-300, 6000); the plane is lined up on it.
     game.start();
     game.plane = newPlane({
-      x: -290,
-      y: 5960,
+      x: -295,
+      y: 5940,
       heading: 0.05,
       altitude: 180,
       speed: 112,
@@ -74,9 +74,9 @@ export function setupShot(game, name) {
     game.start();
     game.plane = newPlane({
       x: 4,
-      y: 10120,
+      y: 10300,
       heading: 0,
-      altitude: 26,
+      altitude: 60,
       speed: 56,
       fuel: 41,
     });
